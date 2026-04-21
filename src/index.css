@@ -1,0 +1,35 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Poppins", ui-sans-serif, system-ui, sans-serif;
+}
+
+@layer base {
+  body {
+    @apply bg-[#060606] text-white antialiased selection:bg-orange-500/30 overflow-x-hidden;
+  }
+}
+
+.glass-card {
+  @apply backdrop-blur-3xl bg-white/[0.02] border border-white/[0.05] shadow-[0_8px_32px_0_rgba(0,0,0,0.4)];
+  border-radius: 6px;
+}
+
+.bg-dot-pattern {
+  background-image: radial-gradient(rgba(249, 115, 22, 0.1) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+.animated-gradient {
+  background: radial-gradient(circle at 50% 50%, rgba(249, 115, 22, 0.08) 0%, transparent 50%);
+  filter: blur(80px);
+}
+
+.table-row-h {
+  @apply bg-white/[0.02] border border-white/[0.04] transition-all duration-300;
+  border-radius: 12px; /* fallback for small elements */
+}
+
+.sophisticated-gradient {
+  background: linear-gradient(135deg, rgba(249, 115, 22, 0.1) 0%, rgba(249, 115, 22, 0) 100%);
+}
