@@ -53,6 +53,7 @@ interface DayData {
   operations: number;
   hits: number;
   errors: number;
+  isNonWorkingDay?: boolean;
 }
 
 interface Summary {
@@ -135,33 +136,71 @@ export default function App() {
         setError(null);
         
         const envUrl = (import.meta as any).env.VITE_SPREADSHEET_URL;
-        const baseUsedUrl = envUrl || DEFAULT_SPREADSHEET_URL;
+        let baseUsedUrl = envUrl || DEFAULT_SPREADSHEET_URL;
         
-        // Cache busting to ensure we always get the latest version from the server
-        const usedUrl = `${baseUsedUrl}${baseUsedUrl.includes('?') ? '&' : '?'}_cache_bust=${Date.now()}`;
-        
-        // Configuration for the fetch request
-        const fetchOptions: RequestInit = {
-          mode: 'cors',
-          cache: 'no-cache', // Browser level cache busting
-          headers: {
-            'Pragma': 'no-cache',
-            'Cache-Control': 'no-cache'
-          }
-        };
+        // Clean URL whitespace
+        baseUsedUrl = baseUsedUrl.trim();
 
-        const response = await fetch(usedUrl, fetchOptions);
+        // Basic check for "Published to web" format
+        const isPublished = baseUsedUrl.includes('/pub') || baseUsedUrl.includes('/d/e/');
+        const isExport = baseUsedUrl.includes('/export');
+        
+        if (!isPublished && !isExport && baseUsedUrl.includes('docs.google.com/spreadsheets/d/')) {
+          // Attempt to convert sharing link to export link if possible
+          const spreadSheetId = baseUsedUrl.match(/\/d\/([a-zA-Z0-9-_]+)/)?.[1];
+          if (spreadSheetId) {
+            baseUsedUrl = `https://docs.google.com/spreadsheets/d/${spreadSheetId}/export?format=csv`;
+          }
+        }
+
+        // Cache busting only if it's a published link (export links sometimes fail with extra params)
+        const usedUrl = baseUsedUrl.includes('?') 
+          ? `${baseUsedUrl}&_cb=${Date.now()}` 
+          : `${baseUsedUrl}?_cb=${Date.now()}`;
+        
+        let response;
+        try {
+          response = await fetch(usedUrl);
+        } catch (fetchErr) {
+          console.warn("Direct fetch failed, trying proxy fallback...", fetchErr);
+          // Fallback to a proxy if direct fetch fails (sometimes helps with specific CORS/Network issues)
+          const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(usedUrl)}`;
+          const proxyResponse = await fetch(proxyUrl);
+          if (!proxyResponse.ok) throw fetchErr;
+          
+          const proxyData = await proxyResponse.json();
+          const csvText = proxyData.contents;
+          if (!csvText || csvText.length < 10) throw new Error("Falha ao recuperar dados via proxy.");
+          
+          // Mimic a response object or just process text directly
+          return processCsv(csvText);
+        }
         
         if (!response.ok) {
-          throw new Error(`Servidor da Planilha retornou erro ${response.status}. Verifique se a planilha está publicada.`);
+          if (response.status === 400) {
+            throw new Error("Erro 400: Parâmetros inválidos. Certifique-se de que a planilha foi 'Publicada na Web' (Arquivo > Compartilhar > Publicar na Web) selecionando 'Valores separados por vírgula (.csv)' e que o link utilizado seja o link de publicação, não o link de edição.");
+          }
+          if (response.status === 404) {
+            throw new Error("Erro 404: Planilha não encontrada. Verifique se o link da planilha está correto e se ela ainda existe.");
+          }
+          throw new Error(`Erro do Servidor (${response.status}): Verifique se a planilha está publicada adequadamente como CSV.`);
         }
 
         const csvText = await response.text();
-        if (!csvText || csvText.length < 10) {
-          throw new Error("Os dados recebidos da planilha estão incompletos ou vazios.");
-        }
-        
-        Papa.parse(csvText, {
+        processCsv(csvText);
+      } catch (err: any) {
+        console.error("Fetch error:", err);
+        setError(err instanceof Error ? err.message : "Falha na conexão.");
+        setLoading(false);
+      }
+    };
+
+    const processCsv = (csvText: string) => {
+      if (!csvText || csvText.length < 10) {
+        throw new Error("Os dados recebidos da planilha estão incompletos ou vazios.");
+      }
+      
+      Papa.parse(csvText, {
           header: false,
           skipEmptyLines: true,
           complete: (results) => {
@@ -245,7 +284,7 @@ export default function App() {
                 "25/12"  // Natal
               ];
               
-              const businessDays: { date: number, label: string }[] = [];
+              const monthCalendarDays: { date: number, label: string, isNonWorkingDay: boolean }[] = [];
               for (let d = 1; d <= daysInMonth; d++) {
                 const date = new Date(year, month, d);
                 const dayOfWeek = date.getDay(); // 0 (Sun) to 6 (Sat)
@@ -257,37 +296,39 @@ export default function App() {
                 const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
                 const isHoliday = holidays2026.includes(dateKey);
 
-                if (!isWeekend && !isHoliday) {
-                  businessDays.push({ date: d, label: dateKey });
-                }
+                monthCalendarDays.push({ 
+                  date: d, 
+                  label: dateKey,
+                  isNonWorkingDay: isWeekend || isHoliday
+                });
               }
 
               // 3. Extract data following the spreadsheet sequence (DIA 01, DIA 02...)
-              // but mapping it to business calendar labels and filtering by current date
-              const processedData: DayData[] = businessDays
-                .filter(bDay => bDay.date <= now.getDate()) // ONLY show days up to today
-                .map((bDay, index) => {
-                  const opIndex = index + 1; // Operation index (1 to 22 approx)
-                  const searchLabel = `DIA ${opIndex.toString().padStart(2, '0')}`;
+              // Now mapped directly: DIA 01 = Day 1, DIA 02 = Day 2...
+              const processedData: DayData[] = monthCalendarDays
+                .filter(calDay => calDay.date <= now.getDate()) // ONLY show days up to today
+                .map((calDay) => {
+                  const searchLabel = `DIA ${calDay.date.toString().padStart(2, '0')}`;
                   
                   const dayRow = rows.find(r => r[0]?.toUpperCase().includes(searchLabel));
                   
                   // Lucro (Coluna B)
                   const profit = parseValue(dayRow && dayRow[1] ? dayRow[1] : "");
 
-                  // Operações (Coluna E)
+                  // Operações (Coluna E or contextually column 4 in array)
                   const ops = parseValue(dayRow && dayRow[4] ? dayRow[4] : "");
                   
                   return {
-                    day: opIndex,
-                    displayDay: bDay.date,
-                    displayLabel: bDay.label,
+                    day: calDay.date,
+                    displayDay: calDay.date,
+                    displayLabel: calDay.label,
                     risk: foundRisk,
                     profit: profit,
-                    withdrawals: 0, // No longer per-day from table
+                    withdrawals: 0,
                     operations: ops,
                     hits: profit > 0 ? 1 : 0,
                     errors: profit < 0 ? 1 : 0,
+                    isNonWorkingDay: calDay.isNonWorkingDay
                   };
                 });
 
@@ -318,12 +359,6 @@ export default function App() {
             setLoading(false);
           }
         });
-      } catch (err: any) {
-        console.error("Fetch error:", err);
-        setError(err instanceof Error ? err.message : "Falha na conexão.");
-        setLoading(false);
-        // If it's a connection error, we already have the last valid data via initial state / caching
-      }
     };
 
     fetchData(true);
@@ -646,7 +681,7 @@ export default function App() {
                 <OperationRow label="Saques" value={summary.totalWithdrawals} isCurrency color="bg-blue-500" />
                 <OperationRow label="Taxas (19%)" value={summary.taxes} isCurrency color="bg-orange-500" />
                 <div className="mt-4 p-5 bg-orange-500/10 border border-orange-500/20 rounded-md text-center">
-                  <p className="text-[10px] text-orange-500 uppercase font-bold tracking-widest mb-1">Disponível para Saque</p>
+                  <p className="text-[10px] text-orange-500 uppercase font-bold tracking-widest mb-1">VALOR LIVRE DE TAXAS</p>
                   <p className="text-2xl font-light text-white">{formatCurrency(summary.availableBalance)}</p>
                 </div>
               </div>
@@ -727,15 +762,23 @@ const DayRow: React.FC<{ data: DayData }> = ({ data }) => {
     <motion.div 
       initial={{ opacity: 0, x: -10 }}
       animate={{ opacity: 1, x: 0 }}
-      className="group bg-white/[0.01] border border-white/[0.05] hover:bg-white/[0.03] transition-all p-4 md:p-6 rounded-md md:grid md:grid-cols-4 flex flex-col gap-4 md:gap-8 items-center md:items-stretch"
+      className={cn(
+        "group border transition-all p-4 md:p-6 rounded-md md:grid md:grid-cols-4 flex flex-col gap-4 md:gap-8 items-center md:items-stretch",
+        data.isNonWorkingDay 
+          ? "bg-rose-500/5 border-rose-500/20" 
+          : "bg-white/[0.01] border-white/[0.05] hover:bg-white/[0.03]"
+      )}
     >
       {/* Col 1: Date/Op & Profit (Mobile side-by-side) */}
       <div className="flex items-center gap-4 w-full md:w-auto justify-between md:justify-start">
         <div className="flex items-center gap-4">
-          <span className="text-xs font-mono font-bold text-gray-600 group-hover:text-orange-500 transition-colors tracking-tighter">
+          <span className={cn(
+            "text-xs font-mono font-bold transition-colors tracking-tighter",
+            data.isNonWorkingDay ? "text-rose-500" : "text-gray-600 group-hover:text-orange-500"
+          )}>
             {data.displayLabel || data.day.toString().padStart(2, '0')}
           </span>
-          <span className="text-sm font-medium tracking-wide uppercase">{data.day}ª Op.</span>
+          <span className="text-sm font-medium tracking-wide uppercase">Dia {data.day}</span>
         </div>
         
         {/* Profit on the right side for Mobile Only */}
@@ -772,9 +815,9 @@ const DayRow: React.FC<{ data: DayData }> = ({ data }) => {
         </div>
         <span className={cn(
           "text-[9px] font-bold uppercase tracking-[0.2em] shrink-0",
-          isPositive ? "text-emerald-500" : isLoss ? "text-rose-500" : "text-orange-500"
+          data.isNonWorkingDay ? "text-rose-500/50" : (isPositive ? "text-emerald-500" : isLoss ? "text-rose-500" : "text-orange-500")
         )}>
-          {isPositive ? "Win" : isLoss ? "Loss" : "Flat"}
+          {data.isNonWorkingDay ? "OFF" : (isPositive ? "Win" : isLoss ? "Loss" : "Flat")}
         </span>
       </div>
 
