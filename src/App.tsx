@@ -29,6 +29,8 @@ import { motion, AnimatePresence } from 'motion/react';
 import Papa from 'papaparse';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
+import jsPDF from 'jspdf';
+import autoTable from 'jspdf-autotable';
 
 // --- Utilities ---
 function cn(...inputs: ClassValue[]) {
@@ -71,6 +73,27 @@ interface Summary {
 
 const DEFAULT_SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vT6zXjo6h4Y64wnFq1_U_z4DtpIG4OM6JlII1mTVPyyeS3A7WPRh15yhat_kfjRHHaWaYInOncsqf8L/pub?output=csv";
 
+const MONTHS = [
+  "Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho", 
+  "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"
+];
+
+// Mapping of Month Index to Spreadsheet GID (if applicable)
+const MONTH_GIDS: Record<number, string> = {
+  0: "",         // Jan
+  1: "",         // Feb
+  2: "",         // Mar
+  3: "0",        // Apr
+  4: "804947437", // May
+  5: "1824223648", // Jun
+  6: "742104149", // Jul
+  7: "483152687", // Aug
+  8: "863872661", // Sep
+  9: "148047064", // Oct
+  10: "1158204145", // Nov
+  11: "484266407", // Dec
+};
+
 interface UserAuth {
   username: string;
   password: string;
@@ -101,6 +124,7 @@ export default function App() {
   const [lastUpdated, setLastUpdated] = useState<string>(() => {
     return localStorage.getItem('last_updated_time') || '';
   });
+  const [selectedMonth, setSelectedMonth] = useState<number>(new Date().getMonth());
 
   useEffect(() => {
     // Disable right-click
@@ -132,7 +156,11 @@ export default function App() {
   useEffect(() => {
     const fetchData = async (isInitial = true) => {
       try {
-        if (isInitial) setLoading(true);
+        if (isInitial) {
+          setLoading(true);
+          setData([]); // Limpa os dados anteriores para garantir que o usuário veja a transição
+        }
+        // Clear previous data on month change to avoid stale state
         setError(null);
         
         const envUrl = (import.meta as any).env.VITE_SPREADSHEET_URL;
@@ -140,6 +168,16 @@ export default function App() {
         
         // Clean URL whitespace
         baseUsedUrl = baseUsedUrl.trim();
+
+        // Target specific tab (GID) if defined for the selected month
+        const targetGid = MONTH_GIDS[selectedMonth];
+        if (targetGid) {
+          if (baseUsedUrl.includes('gid=')) {
+            baseUsedUrl = baseUsedUrl.replace(/gid=[^&]+/, `gid=${targetGid}`);
+          } else {
+            baseUsedUrl += (baseUsedUrl.includes('?') ? '&' : '?') + `gid=${targetGid}`;
+          }
+        }
 
         // Basic check for "Published to web" format
         const isPublished = baseUsedUrl.includes('/pub') || baseUsedUrl.includes('/d/e/');
@@ -159,35 +197,49 @@ export default function App() {
           : `${baseUsedUrl}?_cb=${Date.now()}`;
         
         let response;
+        let csvText = '';
+
+        const tryFetch = async (url: string, timeout = 5000) => {
+          const controller = new AbortController();
+          const id = setTimeout(() => controller.abort(), timeout);
+          try {
+            const res = await fetch(url, { signal: controller.signal });
+            clearTimeout(id);
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            return await res.text();
+          } catch (err) {
+            clearTimeout(id);
+            throw err;
+          }
+        };
+
         try {
-          response = await fetch(usedUrl);
-        } catch (fetchErr) {
-          console.warn("Direct fetch failed, trying proxy fallback...", fetchErr);
-          // Fallback to a proxy if direct fetch fails (sometimes helps with specific CORS/Network issues)
-          const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(usedUrl)}`;
-          const proxyResponse = await fetch(proxyUrl);
-          if (!proxyResponse.ok) throw fetchErr;
-          
-          const proxyData = await proxyResponse.json();
-          const csvText = proxyData.contents;
-          if (!csvText || csvText.length < 10) throw new Error("Falha ao recuperar dados via proxy.");
-          
-          // Mimic a response object or just process text directly
-          return processCsv(csvText);
+          // Attempt 1: Direct fetch with cache bust (Timeout 3s - fast fail if blocked)
+          csvText = await tryFetch(usedUrl, 3000);
+        } catch (err1) {
+          console.warn("Attempt 1 failed (Direct + CB):", err1);
+          try {
+            // Attempt 2: Direct fetch without cache bust (Timeout 3s)
+            csvText = await tryFetch(baseUsedUrl, 3000);
+          } catch (err2) {
+            console.warn("Attempt 2 failed (Direct):", err2);
+            try {
+              // Attempt 3: Proxy fallback (Timeout 8s - proxies are slower but more reliable)
+              const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(baseUsedUrl)}`;
+              const proxyResponse = await tryFetch(proxyUrl, 8000);
+              const proxyData = JSON.parse(proxyResponse);
+              csvText = proxyData.contents;
+              if (!csvText || csvText.length < 10) throw new Error("Proxy empty content");
+            } catch (err3) {
+              console.error("All fetch attempts failed:", err3);
+              throw new Error("Erro de Conexão: O Google demorou a responder. Tente novamente em instantes ou verifique se a planilha está publicada.");
+            }
+          }
         }
         
-        if (!response.ok) {
-          if (response.status === 400) {
-            throw new Error("Erro 400: Parâmetros inválidos. Certifique-se de que a planilha foi 'Publicada na Web' (Arquivo > Compartilhar > Publicar na Web) selecionando 'Valores separados por vírgula (.csv)' e que o link utilizado seja o link de publicação, não o link de edição.");
-          }
-          if (response.status === 404) {
-            throw new Error("Erro 404: Planilha não encontrada. Verifique se o link da planilha está correto e se ela ainda existe.");
-          }
-          throw new Error(`Erro do Servidor (${response.status}): Verifique se a planilha está publicada adequadamente como CSV.`);
+        if (csvText) {
+          processCsv(csvText);
         }
-
-        const csvText = await response.text();
-        processCsv(csvText);
       } catch (err: any) {
         console.error("Fetch error:", err);
         setError(err instanceof Error ? err.message : "Falha na conexão.");
@@ -205,25 +257,19 @@ export default function App() {
           skipEmptyLines: true,
           complete: (results) => {
             try {
-              const rows = results.data as string[][];
-              if (!rows || rows.length === 0) {
-                setError("Planilha vazia ou com formato inválido.");
-                setLoading(false);
-                return;
-              }
-
+              const rows = (results.data as string[][]) || [];
+              
               // Helper to parse numbers from Brazilian/International formats correctly
               const parseValue = (val: string) => {
                 if (!val) return 0;
                 // Remove spaces and currency symbols
                 const cleaned = val.trim().replace(/[^\d.,-]/g, '');
                 // Logic for BR format: Dots as thousands, comma as decimal
-                // We remove dots and then replace comma with dot for parseFloat
                 return parseFloat(cleaned.replace(/\./g, '').replace(',', '.')) || 0;
               };
 
-              // 1. Find Initial Balance, Risk and Total Withdrawals
-              let foundInitialBalance = 5000;
+              // 1. Find Initial Balance, Risk and Total Withdrawals with safe defaults
+              let foundInitialBalance = 0;
               const balanceRow = rows.find(r => r[0]?.toUpperCase().includes("APORTE INICIAL"));
               if (balanceRow && balanceRow[1]) {
                 foundInitialBalance = parseValue(balanceRow[1]);
@@ -235,14 +281,12 @@ export default function App() {
                 foundRisk = parseValue(riskRow[1]);
               }
 
-              // Sum withdrawals from the horizontal row "SAQUES REALIZADOS"
+              // Sum withdrawals
               let foundTotalWithdrawals = 0;
               const withdrawalRow = rows.find(r => r[0]?.toUpperCase().includes("SAQUES REALIZADOS"));
               if (withdrawalRow) {
-                // Sum all cells starting from index 1 that are numbers
                 for (let i = 1; i < withdrawalRow.length; i++) {
-                  const val = parseValue(withdrawalRow[i]);
-                  foundTotalWithdrawals += val;
+                  foundTotalWithdrawals += parseValue(withdrawalRow[i]);
                 }
               }
 
@@ -260,37 +304,28 @@ export default function App() {
                   }
                 }
               }
-              setAllowedUsers(foundUsers);
+              
+              if (foundUsers.length > 0) {
+                setAllowedUsers(foundUsers);
+              }
 
-              // 2. Logic for Business Days (Excluding Weekends and Brazilian National Holidays)
-              const now = new Date();
-              const year = now.getFullYear();
-              const month = now.getMonth(); // 0-11
-              const daysInMonth = new Date(year, month + 1, 0).getDate();
+              // 2. Logic for Business Days
+              const year = new Date().getFullYear();
+              const daysInMonth = new Date(year, selectedMonth + 1, 0).getDate();
 
               // Brazilian National Holidays 2026 (Format: "DD/MM")
               const holidays2026 = [
-                "01/01", // Confraternização Universal
-                "16/02", "17/02", // Carnaval
-                "03/04", // Sexta-feira Santa
-                "21/04", // Tiradentes
-                "01/05", // Dia do Trabalho
-                "04/06", // Corpus Christi
-                "07/09", // Independência
-                "12/10", // Nossa Senhora Aparecida
-                "02/11", // Finados
-                "15/11", // Proclamação da República
-                "20/11", // Dia da Consciência Negra
-                "25/12"  // Natal
+                "01/01", "16/02", "17/02", "03/04", "21/04", "01/05", 
+                "04/06", "07/09", "12/10", "02/11", "15/11", "20/11", "25/12"
               ];
               
               const monthCalendarDays: { date: number, label: string, isNonWorkingDay: boolean }[] = [];
               for (let d = 1; d <= daysInMonth; d++) {
-                const date = new Date(year, month, d);
+                const date = new Date(year, selectedMonth, d);
                 const dayOfWeek = date.getDay(); // 0 (Sun) to 6 (Sat)
                 
                 const dayStr = d.toString().padStart(2, '0');
-                const monthStr = (month + 1).toString().padStart(2, '0');
+                const monthStr = (selectedMonth + 1).toString().padStart(2, '0');
                 const dateKey = `${dayStr}/${monthStr}`;
 
                 const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
@@ -303,34 +338,31 @@ export default function App() {
                 });
               }
 
-              // 3. Extract data following the spreadsheet sequence (DIA 01, DIA 02...)
-              // Now mapped directly: DIA 01 = Day 1, DIA 02 = Day 2...
-              const processedData: DayData[] = monthCalendarDays
-                .filter(calDay => calDay.date <= now.getDate()) // ONLY show days up to today
-                .map((calDay) => {
-                  const searchLabel = `DIA ${calDay.date.toString().padStart(2, '0')}`;
-                  
-                  const dayRow = rows.find(r => r[0]?.toUpperCase().includes(searchLabel));
-                  
-                  // Lucro (Coluna B)
-                  const profit = parseValue(dayRow && dayRow[1] ? dayRow[1] : "");
+              // 3. Extract data for the full month (don't filter anymore)
+              const processedData: DayData[] = monthCalendarDays.map((calDay) => {
+                const searchLabel = `DIA ${calDay.date.toString().padStart(2, '0')}`;
+                
+                const dayRow = rows.find(r => r[0]?.toUpperCase().includes(searchLabel));
+                
+                // Profit (Coluna B)
+                const profit = parseValue(dayRow && dayRow[1] ? dayRow[1] : "");
 
-                  // Operações (Coluna E or contextually column 4 in array)
-                  const ops = parseValue(dayRow && dayRow[4] ? dayRow[4] : "");
-                  
-                  return {
-                    day: calDay.date,
-                    displayDay: calDay.date,
-                    displayLabel: calDay.label,
-                    risk: foundRisk,
-                    profit: profit,
-                    withdrawals: 0,
-                    operations: ops,
-                    hits: profit > 0 ? 1 : 0,
-                    errors: profit < 0 ? 1 : 0,
-                    isNonWorkingDay: calDay.isNonWorkingDay
-                  };
-                });
+                // Operações (Coluna E or contextually column 4 in array)
+                const ops = parseValue(dayRow && dayRow[4] ? dayRow[4] : "");
+                
+                return {
+                  day: calDay.date,
+                  displayDay: calDay.date,
+                  displayLabel: calDay.label,
+                  risk: foundRisk,
+                  profit: profit,
+                  withdrawals: 0,
+                  operations: ops,
+                  hits: profit > 0 ? 1 : 0,
+                  errors: profit < 0 ? 1 : 0,
+                  isNonWorkingDay: calDay.isNonWorkingDay
+                };
+              });
 
               setInitialBalance(foundInitialBalance);
               setTotalWithdrawals(foundTotalWithdrawals);
@@ -368,7 +400,7 @@ export default function App() {
     }, 30000);
 
     return () => clearInterval(interval);
-  }, []);
+  }, [selectedMonth]);
 
   const summary = useMemo<Summary>(() => {
     const totals = data.reduce((acc, curr) => ({
@@ -421,6 +453,100 @@ export default function App() {
     setIsAuthenticated(false);
     sessionStorage.removeItem('isAuth');
     setLoginForm({ user: '', pass: '' });
+  };
+
+  const handlePrint = () => {
+    const doc = new jsPDF();
+    const monthName = MONTHS[selectedMonth];
+    const year = new Date().getFullYear();
+
+    // Configurações de cores e fontes
+    const primaryColor: [number, number, number] = [249, 115, 22]; // Orange-500
+    const secondaryColor: [number, number, number] = [60, 60, 60];
+
+    // Título
+    doc.setFontSize(22);
+    doc.setTextColor(secondaryColor[0], secondaryColor[1], secondaryColor[2]);
+    doc.text('CENTRAL FIG', 14, 20);
+    
+    doc.setFontSize(16);
+    doc.text(`Relatório de Performance - ${monthName} ${year}`, 14, 30);
+    
+    doc.setFontSize(9);
+    doc.setTextColor(150);
+    doc.text(`Gerado eletronicamente em: ${new Date().toLocaleString('pt-BR')}`, 14, 36);
+
+    // Linha divisória
+    doc.setDrawColor(230);
+    doc.line(14, 40, 196, 40);
+
+    // Resumo Financeiro
+    doc.setFontSize(11);
+    doc.setTextColor(0);
+    doc.text("Resumo Financeiro do Período", 14, 48);
+    
+    const summaryRows = [
+      ["Aporte Inicial", formatCurrency(summary.initialBalance)],
+      ["Lucro Bruto", formatCurrency(summary.totalProfit)],
+      ["Saques Realizados", formatCurrency(summary.totalWithdrawals)],
+      ["Taxas Acumuladas (19%)", formatCurrency(summary.taxes)],
+      ["Valor Disponível para Saque", formatCurrency(summary.availableBalance)],
+      ["Taxa de Acerto", `${summary.winRate.toFixed(1)}%`],
+      ["Saldo Consolidado Total", formatCurrency(currentBalance)]
+    ];
+
+    autoTable(doc, {
+      startY: 52,
+      head: [["Métrica", "Valor"]],
+      body: summaryRows,
+      theme: 'grid',
+      styles: { fontSize: 8, cellPadding: 1.5 },
+      headStyles: { fillColor: primaryColor, textColor: [255, 255, 255], fontStyle: 'bold' },
+      columnStyles: {
+        0: { fontStyle: 'bold', cellWidth: 80 },
+        1: { halign: 'right' }
+      }
+    });
+
+    // Espaçamento para a próxima tabela
+    const finalY = (doc as any).lastAutoTable.finalY + 8;
+
+    // Detalhamento Diário
+    doc.setFontSize(11);
+    doc.text("Detalhamento das Operações Diárias", 14, finalY);
+
+    const tableData = data.map(day => [
+      day.displayLabel || day.day.toString().padStart(2, '0'),
+      formatCurrency(day.profit),
+      day.isNonWorkingDay ? "OFF (Fim de Semana/Feriado)" : (day.profit > 0 ? "VITÓRIA (WIN)" : day.profit < 0 ? "DERROTA (LOSS)" : "EMPATE (FLAT)"),
+      `${day.operations} ops`
+    ]);
+
+    autoTable(doc, {
+      startY: finalY + 4,
+      head: [["Data", "Lucro/Prejuízo", "Resultado", "Volume"]],
+      body: tableData,
+      theme: 'striped',
+      styles: { fontSize: 7.5, cellPadding: 1.2 },
+      headStyles: { fillColor: [80, 80, 80], textColor: [255, 255, 255] },
+      columnStyles: {
+        1: { halign: 'right' },
+        3: { halign: 'center' }
+      },
+      margin: { bottom: 15 }
+    });
+
+    // Rodapé
+    const pageCount = (doc as any).internal.getNumberOfPages();
+    for (let i = 1; i <= pageCount; i++) {
+        doc.setPage(i);
+        doc.setFontSize(8);
+        doc.setTextColor(150);
+        doc.text('Relatório Confidencial - Central FIG Dashboard', doc.internal.pageSize.width / 2, doc.internal.pageSize.height - 10, { align: 'center' });
+    }
+
+    // Salvar o PDF
+    doc.save(`Relatorio_CentralFIG_${monthName}_${year}.pdf`);
   };
 
   if (!isAuthenticated && !loading) {
@@ -570,9 +696,9 @@ export default function App() {
       </div>
 
       {/* Main Content */}
-      <main className="relative z-10 max-w-[1400px] mx-auto p-6 md:p-12 space-y-12">
+      <main className="relative z-10 max-w-[1400px] mx-auto p-6 md:p-12 space-y-12 print:p-0 print:space-y-4">
         {/* Header with Branding & Logout */}
-        <div className="flex items-center justify-center md:justify-between z-20 relative">
+        <div className="flex items-center justify-center md:justify-between z-20 relative print:hidden">
           <div className="flex items-center gap-4">
             <img 
               src="https://lh3.googleusercontent.com/d/1IG128FJsxnPPIy1y2XzmRW3fLSxFxktZ" 
@@ -598,7 +724,7 @@ export default function App() {
         </div>
 
         {error && (
-          <div className="flex flex-col md:flex-row items-center justify-between gap-4 p-5 bg-orange-500/10 border border-orange-500/20 rounded-md text-orange-200 text-sm">
+          <div className="flex flex-col md:flex-row items-center justify-between gap-4 p-5 bg-orange-500/10 border border-orange-500/20 rounded-md text-orange-200 text-sm print:hidden">
             <div className="flex items-center gap-3">
               <AlertTriangle className="text-orange-500 shrink-0" size={20} />
               <p>
@@ -616,20 +742,46 @@ export default function App() {
           </div>
         )}
 
+        {/* Month Navigation */}
+        <section className="print:hidden">
+          <div className="glass-card p-2">
+            <div className="flex items-center gap-1 overflow-x-auto no-scrollbar py-1 px-1">
+              {MONTHS.map((month, index) => {
+                const isSelected = selectedMonth === index;
+                
+                return (
+                  <button
+                    key={month}
+                    onClick={() => setSelectedMonth(index)}
+                    className={cn(
+                      "px-4 py-2 rounded-md text-[9px] uppercase font-bold tracking-widest transition-all shrink-0 whitespace-nowrap",
+                      isSelected 
+                        ? "bg-orange-500 text-white shadow-lg shadow-orange-500/20" 
+                        : "text-gray-500 hover:text-white hover:bg-white/5"
+                    )}
+                  >
+                    {month}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </section>
+
         {/* Hero Section: Stats + Charts */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-10">
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-10 print:grid-cols-1">
           {/* Main Balance Card */}
-          <section className="lg:col-span-2 glass-card p-10 flex flex-col justify-between overflow-hidden relative group">
-            <div className="absolute -top-32 -right-32 w-80 h-80 bg-orange-600/5 blur-[120px] pointer-events-none group-hover:bg-orange-600/10 transition-all duration-1000"></div>
+          <section className="lg:col-span-2 glass-card p-10 flex flex-col justify-between overflow-hidden relative group print:bg-white print:text-black print:p-6 print:border-black">
+            <div className="absolute -top-32 -right-32 w-80 h-80 bg-orange-600/5 blur-[120px] pointer-events-none group-hover:bg-orange-600/10 transition-all duration-1000 print:hidden"></div>
             
             <div className="flex flex-col items-center justify-center z-10 text-center">
               <div>
-                <p className="text-gray-500 text-xs font-semibold uppercase tracking-[0.2em] mb-4">Saldo Consolidado</p>
+                <p className="text-gray-500 text-xs font-semibold uppercase tracking-[0.2em] mb-4 print:text-black print:mb-2">Saldo Consolidado</p>
                 <div className="flex flex-col items-center justify-center gap-3">
-                  <h2 className="text-5xl md:text-6xl font-light tracking-tight">{formatCurrency(currentBalance)}</h2>
+                  <h2 className="text-5xl md:text-6xl font-light tracking-tight print:text-4xl">{formatCurrency(currentBalance)}</h2>
                   <span className={cn(
-                    "text-xs font-medium px-2.5 py-1 tracking-wider uppercase",
-                    summary.totalProfit >= 0 ? "text-emerald-400 bg-emerald-400/5 border border-emerald-400/20" : "text-rose-400 bg-rose-400/5 border border-rose-400/20"
+                    "text-xs font-medium px-2.5 py-1 tracking-wider uppercase print:text-black",
+                    summary.totalProfit >= 0 ? "text-emerald-400 bg-emerald-400/5 border border-emerald-400/20 print:border-black" : "text-rose-400 bg-rose-400/5 border border-rose-400/20 print:border-black"
                   )}>
                     {summary.totalProfit >= 0 ? "+" : ""}
                     {((summary.totalProfit / summary.initialBalance) * 100).toFixed(2)}%
@@ -638,7 +790,7 @@ export default function App() {
               </div>
             </div>
 
-            <div className="h-[160px] md:h-[240px] mt-12 z-10 w-full">
+            <div className="h-[160px] md:h-[240px] mt-12 z-10 w-full print:hidden">
                <ResponsiveContainer width="100%" height="100%">
                 <AreaChart data={data.filter(d => d.risk > 0 || d.profit !== 0)}>
                   <defs>
@@ -659,56 +811,64 @@ export default function App() {
               </ResponsiveContainer>
             </div>
 
-            <div className="grid grid-cols-2 lg:grid-cols-4 gap-8 mt-12 z-10 border-t border-white/5 pt-8">
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-8 mt-12 z-10 border-t border-white/5 pt-8 print:mt-4 print:pt-4 print:border-black print:grid-cols-2">
               <StatItem label="Aporte Inicial" value={formatCurrency(summary.initialBalance)} />
-              <StatItem label="Lucro Acumulado" value={formatCurrency(summary.totalProfit)} color={summary.totalProfit >= 0 ? "text-emerald-400" : "text-rose-400"} />
+              <StatItem label="Lucro Bruto" value={formatCurrency(summary.totalProfit)} color={summary.totalProfit >= 0 ? "text-emerald-400 print:text-black" : "text-rose-400 print:text-black"} />
               <StatItem label="Taxa de Acerto" value={`${summary.winRate.toFixed(1)}%`} />
               <StatItem label="Risco Diário" value={formatCurrency(summary.dailyRisk)} />
             </div>
           </section>
 
           {/* Financial Breakdown Section */}
-          <section className="glass-card p-10 flex flex-col justify-between">
+          <section className="glass-card p-10 flex flex-col justify-between print:bg-white print:text-black print:p-6 print:border-black">
             <div className="w-full space-y-4">
-              <div className="mb-6 p-4 bg-white/[0.01] border border-white/[0.03] rounded-md text-center">
-                <p className="text-[9px] text-gray-600 uppercase font-bold tracking-[0.25em] mb-1">Volume Total Acumulado</p>
-                <p className="text-lg font-light text-gray-400">{formatCurrency(summary.initialBalance + summary.totalProfit)}</p>
+              <div className="mb-6 p-4 bg-white/[0.01] border border-white/[0.03] rounded-md text-center print:bg-transparent print:border-black">
+                <p className="text-[9px] text-gray-600 uppercase font-bold tracking-[0.25em] mb-1 print:text-black">Volume Total Acumulado</p>
+                <p className="text-lg font-light text-gray-400 print:text-black">{formatCurrency(summary.initialBalance + summary.totalProfit)}</p>
               </div>
 
               <OperationRow label="Acertos" value={summary.totalHits} unit="dias" color="bg-emerald-500" />
               <OperationRow label="Erros" value={summary.totalErrors} unit="dias" color="bg-rose-500" />
-              <div className="pt-4 border-t border-white/5 space-y-4">
+              <div className="pt-4 border-t border-white/5 space-y-4 print:border-black">
                 <OperationRow label="Saques" value={summary.totalWithdrawals} isCurrency color="bg-blue-500" />
                 <OperationRow label="Taxas (19%)" value={summary.taxes} isCurrency color="bg-orange-500" />
-                <div className="mt-4 p-5 bg-orange-500/10 border border-orange-500/20 rounded-md text-center">
-                  <p className="text-[10px] text-orange-500 uppercase font-bold tracking-widest mb-1">VALOR LIVRE DE TAXAS</p>
-                  <p className="text-2xl font-light text-white">{formatCurrency(summary.availableBalance)}</p>
+                <div className="mt-4 p-5 bg-orange-500/10 border border-orange-500/20 rounded-md text-center print:bg-gray-50 print:border-black">
+                  <p className="text-[10px] text-orange-500 uppercase font-bold tracking-widest mb-1 print:text-black">VALOR LIVRE DE TAXAS</p>
+                  <p className="text-2xl font-light text-white print:text-black">{formatCurrency(summary.availableBalance)}</p>
                 </div>
               </div>
             </div>
           </section>
         </div>
 
-        <section className="glass-card p-10">
-          <div className="flex flex-col items-center justify-center text-center mb-12">
-            <div>
-              <h3 className="text-xs font-semibold uppercase tracking-[0.2em] text-gray-500 mb-2">
-                Registro - {new Date().toLocaleString('pt-BR', { month: 'long' })} {new Date().getFullYear()}
+        <section className="glass-card p-10 print:bg-white print:p-0 print:border-none">
+          <div className="flex flex-col md:flex-row items-center justify-between mb-12 print:mb-6">
+            <div className="text-center md:text-left">
+              <h3 className="text-xs font-semibold uppercase tracking-[0.2em] text-gray-500 mb-2 print:text-black">
+                Registro - {MONTHS[selectedMonth]} {new Date().getFullYear()}
               </h3>
-              <p className="text-xl font-light">Controle de Performance</p>
+              <p className="text-xl font-light print:text-black print:text-sm">Controle de Performance</p>
             </div>
+            
+            <button
+              onClick={handlePrint}
+              className="mt-6 md:mt-0 flex items-center gap-2 px-6 py-3 bg-white/5 hover:bg-white/10 border border-white/10 rounded-md transition-all text-[10px] uppercase font-bold tracking-widest print:hidden cursor-pointer"
+            >
+              <LogIn size={14} className="rotate-90" />
+              Baixar Relatório PDF
+            </button>
           </div>
 
           <div className="w-full">
             {/* Table Header - Desktop Only */}
-            <div className="hidden md:grid md:grid-cols-4 text-gray-500 text-[10px] uppercase tracking-widest font-bold px-6 mb-4">
+            <div className="hidden md:grid md:grid-cols-4 text-gray-500 text-[10px] uppercase tracking-widest font-bold px-6 mb-4 print:grid print:grid-cols-4 print:text-black print:px-2">
               <div className="px-2">Data / Operação</div>
               <div className="px-2">Lucro/Prejuízo</div>
               <div className="px-2">Desempenho</div>
               <div className="px-2">Operações</div>
             </div>
 
-            <div className="space-y-3">
+            <div className="space-y-3 print:space-y-1">
               {data.map((day) => (
                 <DayRow key={day.day} data={day} />
               ))}
@@ -725,20 +885,20 @@ export default function App() {
 function StatItem({ label, value, color = "text-white" }: { label: string, value: string, color?: string }) {
   return (
     <div>
-      <p className="text-gray-500 text-[10px] font-semibold uppercase tracking-[0.2em] mb-2">{label}</p>
-      <p className={cn("text-xl font-light tracking-tight", color)}>{value}</p>
+      <p className="text-gray-500 text-[10px] font-semibold uppercase tracking-[0.2em] mb-2 print:text-black print:text-[8px]">{label}</p>
+      <p className={cn("text-xl font-light tracking-tight print:text-black print:text-xs", color)}>{value}</p>
     </div>
   );
 }
 
 function OperationRow({ label, value, color, unit, isCurrency }: { label: string, value: number, color: string, unit?: string, isCurrency?: boolean }) {
   return (
-    <div className="flex items-center justify-between p-4 bg-white/[0.02] border border-white/5 rounded-md transition-colors hover:bg-white/[0.04]">
+    <div className="flex items-center justify-between p-4 bg-white/[0.02] border border-white/5 rounded-md transition-colors hover:bg-white/[0.04] print:bg-transparent print:border-black print:p-2">
       <div className="flex items-center gap-4">
-        <div className={cn("w-2 h-2 rounded-full", color)}></div>
-        <span className="text-xs uppercase tracking-widest font-medium text-gray-400">{label}</span>
+        <div className={cn("w-2 h-2 rounded-full print:border print:border-black", color)}></div>
+        <span className="text-xs uppercase tracking-widest font-medium text-gray-400 print:text-black print:text-[8px]">{label}</span>
       </div>
-      <span className="text-lg font-light">
+      <span className="text-lg font-light print:text-black print:text-xs">
         {isCurrency ? formatCurrency(value) : `${value} ${unit || ''}`}
       </span>
     </div>
@@ -763,26 +923,26 @@ const DayRow: React.FC<{ data: DayData }> = ({ data }) => {
       initial={{ opacity: 0, x: -10 }}
       animate={{ opacity: 1, x: 0 }}
       className={cn(
-        "group border transition-all p-4 md:p-6 rounded-md md:grid md:grid-cols-4 flex flex-col gap-4 md:gap-8 items-center md:items-stretch",
+        "group border transition-all p-4 md:p-6 rounded-md md:grid md:grid-cols-4 flex flex-col gap-4 md:gap-8 items-center md:items-stretch print:grid print:grid-cols-4 print:bg-white print:text-black print:p-2 print:border-black print:gap-2",
         data.isNonWorkingDay 
-          ? "bg-rose-500/5 border-rose-500/20" 
-          : "bg-white/[0.01] border-white/[0.05] hover:bg-white/[0.03]"
+          ? "bg-rose-500/5 border-rose-500/20 print:border-black" 
+          : "bg-white/[0.01] border-white/[0.05] hover:bg-white/[0.03] print:border-black"
       )}
     >
       {/* Col 1: Date/Op & Profit (Mobile side-by-side) */}
-      <div className="flex items-center gap-4 w-full md:w-auto justify-between md:justify-start">
+      <div className="flex items-center gap-4 w-full md:w-auto justify-between md:justify-start print:justify-start">
         <div className="flex items-center gap-4">
           <span className={cn(
-            "text-xs font-mono font-bold transition-colors tracking-tighter",
-            data.isNonWorkingDay ? "text-rose-500" : "text-gray-600 group-hover:text-orange-500"
+            "text-xs font-mono font-bold transition-colors tracking-tighter print:text-[8px]",
+            data.isNonWorkingDay ? "text-rose-500" : "text-gray-600 group-hover:text-orange-500 print:text-black"
           )}>
             {data.displayLabel || data.day.toString().padStart(2, '0')}
           </span>
-          <span className="text-sm font-medium tracking-wide uppercase">Dia {data.day}</span>
+          <span className="text-sm font-medium tracking-wide uppercase print:text-[8px]">Dia {data.day}</span>
         </div>
         
         {/* Profit on the right side for Mobile Only */}
-        <div className="md:hidden flex flex-col items-end">
+        <div className="md:hidden flex flex-col items-end print:hidden">
           <span className={cn(
             "text-sm font-medium tracking-tight",
             isPositive ? "text-emerald-400" : isLoss ? "text-rose-400" : "text-orange-400"
@@ -794,36 +954,36 @@ const DayRow: React.FC<{ data: DayData }> = ({ data }) => {
       </div>
 
       {/* Col 2: Profit (Desktop Only) */}
-      <div className="hidden md:flex flex-col items-center md:items-start w-full md:w-auto">
+      <div className="hidden md:flex flex-col items-center md:items-start w-full md:w-auto print:flex print:flex-col print:items-start">
         <span className={cn(
-          "text-sm font-medium tracking-tight",
-          isPositive ? "text-emerald-400" : isLoss ? "text-rose-400" : "text-orange-400"
+          "text-sm font-medium tracking-tight print:text-[8px]",
+          isPositive ? "text-emerald-400 print:text-black" : isLoss ? "text-rose-400 print:text-black" : "text-orange-400 print:text-black"
         )}>
           {data.profit > 0 ? "+" : ""}{formatCurrency(data.profit)}
         </span>
-        <span className="text-[10px] text-gray-600 uppercase font-bold tracking-widest">Lucro</span>
+        <span className="text-[10px] text-gray-600 uppercase font-bold tracking-widest print:text-[6px]">Lucro</span>
       </div>
 
       {/* Col 3: Performance Bar */}
-      <div className="flex items-center gap-4 min-w-0 w-full md:w-auto px-0 md:px-4">
-        <div className="flex-1 h-[2px] bg-white/5 relative">
+      <div className="flex items-center gap-4 min-w-0 w-full md:w-auto px-0 md:px-4 print:px-0">
+        <div className="flex-1 h-[2px] bg-white/5 relative print:bg-gray-100">
           <motion.div 
             initial={{ width: 0 }}
             animate={{ width: isNeutral ? '20%' : '100%' }}
-            className={cn("h-full transition-all duration-1000", barFullColor)}
+            className={cn("h-full transition-all duration-1000 print:bg-black", barFullColor)}
           />
         </div>
         <span className={cn(
-          "text-[9px] font-bold uppercase tracking-[0.2em] shrink-0",
-          data.isNonWorkingDay ? "text-rose-500/50" : (isPositive ? "text-emerald-500" : isLoss ? "text-rose-500" : "text-orange-500")
+          "text-[9px] font-bold uppercase tracking-[0.2em] shrink-0 print:text-[6px]",
+          data.isNonWorkingDay ? "text-rose-500/50 print:text-gray-400" : (isPositive ? "text-emerald-500 print:text-black" : isLoss ? "text-rose-500 print:text-black" : "text-orange-500 print:text-black")
         )}>
           {data.isNonWorkingDay ? "OFF" : (isPositive ? "Win" : isLoss ? "Loss" : "Flat")}
         </span>
       </div>
 
       {/* Col 4: Operations Bars */}
-      <div className="flex items-center justify-between md:justify-start gap-4 w-full md:w-auto md:pl-8">
-        <div className="flex items-center gap-1.5 shrink-0">
+      <div className="flex items-center justify-between md:justify-start gap-4 w-full md:w-auto md:pl-8 print:pl-0">
+        <div className="flex items-center gap-1.5 shrink-0 print:hidden">
           {Array.from({ length: 4 }).map((_, i) => {
             let activeBars = 0;
             let barColor = "bg-white/5";
@@ -852,7 +1012,7 @@ const DayRow: React.FC<{ data: DayData }> = ({ data }) => {
             );
           })}
         </div>
-        <span className="text-[10px] text-gray-500 font-bold uppercase tracking-widest shrink-0">{data.operations} op.</span>
+        <span className="text-[10px] text-gray-500 font-bold uppercase tracking-widest shrink-0 print:text-[6px]">{data.operations} op.</span>
       </div>
     </motion.div>
   );
