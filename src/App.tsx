@@ -456,7 +456,13 @@ export default function App() {
   };
 
   const handlePrint = () => {
-    const doc = new jsPDF();
+    const doc = new jsPDF({
+      orientation: 'p',
+      unit: 'mm',
+      format: 'a4',
+      putOnlyUsedFonts: true
+    });
+
     const monthName = MONTHS[selectedMonth];
     const year = new Date().getFullYear();
 
@@ -464,86 +470,87 @@ export default function App() {
     const primaryColor: [number, number, number] = [249, 115, 22]; // Orange-500
     const secondaryColor: [number, number, number] = [60, 60, 60];
 
-    // Título
-    doc.setFontSize(22);
+    // Título - Compactar topo
+    doc.setFontSize(18);
     doc.setTextColor(secondaryColor[0], secondaryColor[1], secondaryColor[2]);
-    doc.text('CENTRAL FIG', 14, 20);
+    doc.text('CENTRAL FIG', 14, 15);
     
-    doc.setFontSize(16);
-    doc.text(`Relatório de Performance - ${monthName} ${year}`, 14, 30);
+    doc.setFontSize(14);
+    doc.text(`Relatório de Performance - ${monthName} ${year}`, 14, 23);
     
-    doc.setFontSize(9);
+    doc.setFontSize(8);
     doc.setTextColor(150);
-    doc.text(`Gerado eletronicamente em: ${new Date().toLocaleString('pt-BR')}`, 14, 36);
+    doc.text(`Gerado em: ${new Date().toLocaleString('pt-BR')}`, 14, 28);
 
     // Linha divisória
-    doc.setDrawColor(230);
-    doc.line(14, 40, 196, 40);
+    doc.setDrawColor(240);
+    doc.line(14, 30, 196, 30);
 
     // Resumo Financeiro
-    doc.setFontSize(11);
+    doc.setFontSize(10);
     doc.setTextColor(0);
-    doc.text("Resumo Financeiro do Período", 14, 48);
+    doc.setFont("helvetica", "bold");
+    doc.text("Resumo Financeiro", 14, 37);
     
     const summaryRows = [
       ["Aporte Inicial", formatCurrency(summary.initialBalance)],
       ["Lucro Bruto", formatCurrency(summary.totalProfit)],
       ["Saques Realizados", formatCurrency(summary.totalWithdrawals)],
       ["Taxas Acumuladas (19%)", formatCurrency(summary.taxes)],
-      ["Valor Disponível para Saque", formatCurrency(summary.availableBalance)],
+      ["Valor Livre (Disponível)", formatCurrency(summary.availableBalance)],
       ["Taxa de Acerto", `${summary.winRate.toFixed(1)}%`],
-      ["Saldo Consolidado Total", formatCurrency(currentBalance)]
+      ["Saldo Consolidado", formatCurrency(currentBalance)]
     ];
 
     autoTable(doc, {
-      startY: 52,
+      startY: 40,
       head: [["Métrica", "Valor"]],
       body: summaryRows,
       theme: 'grid',
-      styles: { fontSize: 8, cellPadding: 1.5 },
+      styles: { fontSize: 7.5, cellPadding: 1, font: 'helvetica' },
       headStyles: { fillColor: primaryColor, textColor: [255, 255, 255], fontStyle: 'bold' },
       columnStyles: {
-        0: { fontStyle: 'bold', cellWidth: 80 },
+        0: { fontStyle: 'bold', cellWidth: 60 },
         1: { halign: 'right' }
-      }
+      },
+      margin: { left: 14, right: 14 }
     });
 
-    // Espaçamento para a próxima tabela
-    const finalY = (doc as any).lastAutoTable.finalY + 8;
+    // Espaçamento mínimo
+    const finalY = (doc as any).lastAutoTable.finalY + 6;
 
     // Detalhamento Diário
-    doc.setFontSize(11);
-    doc.text("Detalhamento das Operações Diárias", 14, finalY);
+    doc.setFontSize(10);
+    doc.setFont("helvetica", "bold");
+    doc.text("Detalhamento Diário", 14, finalY);
 
     const tableData = data.map(day => [
       day.displayLabel || day.day.toString().padStart(2, '0'),
       formatCurrency(day.profit),
-      day.isNonWorkingDay ? "OFF (Fim de Semana/Feriado)" : (day.profit > 0 ? "VITÓRIA (WIN)" : day.profit < 0 ? "DERROTA (LOSS)" : "EMPATE (FLAT)"),
-      `${day.operations} ops`
+      day.isNonWorkingDay ? "OFF" : (day.profit > 0 ? "WIN" : day.profit < 0 ? "LOSS" : "FLAT"),
+      day.operations
     ]);
 
     autoTable(doc, {
-      startY: finalY + 4,
-      head: [["Data", "Lucro/Prejuízo", "Resultado", "Volume"]],
+      startY: finalY + 3,
+      head: [["Data", "Lucro/Prejuízo", "Res.", "Op."]],
       body: tableData,
       theme: 'striped',
-      styles: { fontSize: 7.5, cellPadding: 1.2 },
+      styles: { fontSize: 7, cellPadding: 0.8, font: 'helvetica' },
       headStyles: { fillColor: [80, 80, 80], textColor: [255, 255, 255] },
       columnStyles: {
         1: { halign: 'right' },
+        2: { halign: 'center' },
         3: { halign: 'center' }
       },
-      margin: { bottom: 15 }
+      margin: { left: 14, right: 14, bottom: 12 }
     });
 
-    // Rodapé
-    const pageCount = (doc as any).internal.getNumberOfPages();
-    for (let i = 1; i <= pageCount; i++) {
-        doc.setPage(i);
-        doc.setFontSize(8);
-        doc.setTextColor(150);
-        doc.text('Relatório Confidencial - Central FIG Dashboard', doc.internal.pageSize.width / 2, doc.internal.pageSize.height - 10, { align: 'center' });
-    }
+    // Rodapé fixo na única página
+    doc.setFontSize(7);
+    doc.setTextColor(180);
+    doc.setFont("helvetica", "normal");
+    doc.text('Relatório Confidencial - Central FIG Dashboard', doc.internal.pageSize.width / 2, doc.internal.pageSize.height - 8, { align: 'center' });
 
     // Salvar o PDF
     doc.save(`Relatorio_CentralFIG_${monthName}_${year}.pdf`);
