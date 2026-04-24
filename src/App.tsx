@@ -67,8 +67,12 @@ interface Summary {
   totalErrors: number;
   winRate: number;
   dailyRisk: number;
-  taxes: number;
-  availableBalance: number;
+  progress: {
+    total: number;
+    passed: number;
+    remaining: number;
+    percent: number;
+  };
 }
 
 const DEFAULT_SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vT6zXjo6h4Y64wnFq1_U_z4DtpIG4OM6JlII1mTVPyyeS3A7WPRh15yhat_kfjRHHaWaYInOncsqf8L/pub?output=csv";
@@ -179,11 +183,18 @@ export default function App() {
         const targetGid = MONTH_GIDS[selectedMonth];
         
         let exportUrl = baseUsedUrl;
-        const spreadSheetId = baseUsedUrl.match(/\/d\/([a-zA-Z0-9-_]+)/)?.[1];
+        // Detect spreadSheetId for internal sheets (standard /d/ID/ layout)
+        // Published sheets (/d/e/...) use different IDs that don't support /export
+        const isPublished = baseUsedUrl.includes('/d/e/') || baseUsedUrl.includes('2PACX');
         
-        if (spreadSheetId) {
-          // Construct a cleaner export URL which often bypasses certain "pub" blocks
-          exportUrl = `https://docs.google.com/spreadsheets/d/${spreadSheetId}/export?format=csv${targetGid ? `&gid=${targetGid}` : ''}`;
+        if (!isPublished) {
+          const spreadSheetIdMatch = baseUsedUrl.match(/\/d\/([a-zA-Z0-9-_]{20,})\//);
+          const spreadSheetId = spreadSheetIdMatch ? spreadSheetIdMatch[1] : null;
+          
+          if (spreadSheetId) {
+            // Construct a cleaner export URL which often bypasses certain "pub" blocks
+            exportUrl = `https://docs.google.com/spreadsheets/d/${spreadSheetId}/export?format=csv${targetGid ? `&gid=${targetGid}` : ''}`;
+          }
         }
 
         if (targetGid && !baseUsedUrl.includes('gid=')) {
@@ -196,7 +207,7 @@ export default function App() {
         
         let csvText = '';
 
-        const tryFetch = async (url: string, timeout = 25000, retries = 1) => {
+        const tryFetch = async (url: string, timeout = 30000, retries = 2) => {
           for (let i = 0; i <= retries; i++) {
             const controller = new AbortController();
             const id = setTimeout(() => controller.abort(), timeout);
@@ -220,29 +231,30 @@ export default function App() {
                 if (isTimeout) throw new Error("Timeout");
                 throw err;
               }
-              await new Promise(r => setTimeout(r, 800));
+              // Wait longer between retries
+              await new Promise(r => setTimeout(r, 1000 * (i + 1)));
             }
           }
           throw new Error("Falha total");
         };
 
         try {
-          // Attempt 1: Direct Export Fetch
+          // Attempt 1: Direct Export Fetch (if applicable)
           try {
-            csvText = await tryFetch(exportUrl, 15000);
+            csvText = await tryFetch(exportUrl, 20000);
           } catch (e: any) {
             // Attempt 2: Direct Published Fetch
-            csvText = await tryFetch(usedUrl, 15000);
+            csvText = await tryFetch(usedUrl, 20000);
           }
         } catch (err1) {
           console.warn("Direct attempts failed, trying proxies...", err1);
-          setError("Conexão instável: Tentando pular bloqueio de rede...");
+          setError("Detectamos instabilidade na conexão. Tentando rotas alternativas...");
           
           // Cascading Proxies
           try {
             // Proxy 1: AllOrigins (via fetch wrapper)
             const p1 = `https://api.allorigins.win/get?url=${encodeURIComponent(exportUrl)}&_cb=${Date.now()}`;
-            const r1 = await tryFetch(p1, 20000);
+            const r1 = await tryFetch(p1, 25000);
             const data1 = JSON.parse(r1);
             if (data1.contents) csvText = data1.contents;
             else throw new Error("P1 Empty");
@@ -251,25 +263,38 @@ export default function App() {
             try {
               // Proxy 2: CorsProxy.io
               const p2 = `https://corsproxy.io/?${encodeURIComponent(exportUrl)}`;
-              csvText = await tryFetch(p2, 20000);
+              csvText = await tryFetch(p2, 25000);
             } catch (errProxy2) {
               console.warn("Proxy 2 failed:", errProxy2);
               try {
-                // Proxy 3: Backup Public Gateway
+                // Proxy 3: Codetabs
                 const p3 = `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(exportUrl)}`;
-                csvText = await tryFetch(p3, 20000);
+                csvText = await tryFetch(p3, 25000);
               } catch (errProxy3: any) {
-                console.error("All high-resilience paths failed:", errProxy3);
-                
-                const cached = localStorage.getItem('last_valid_data');
-                if (cached && cached !== '[]') {
-                  setData(JSON.parse(cached));
-                  setLoading(false);
-                  setError("Aviso: Bloqueio de rede detectado. Exibindo última versão salva.");
-                  return;
-                }
+                // Proxy 4: Cloudflare Worker Gateway (Common public one)
+                try {
+                  const p4 = `https://js-proxy.demetriofotografia.workers.dev/?url=${encodeURIComponent(exportUrl)}`;
+                  csvText = await tryFetch(p4, 25000);
+                } catch (errProxy4: any) {
+                  console.error("All high-resilience paths failed:", errProxy4);
+                  
+                  const cached = localStorage.getItem('last_valid_data');
+                  if (cached) {
+                    try {
+                      const parsed = JSON.parse(cached);
+                      if (parsed && Array.isArray(parsed) && parsed.length > 0) {
+                        setData(parsed);
+                        setLoading(false);
+                        setError("Erro de rede: Exibindo dados salvos em cache.");
+                        return;
+                      }
+                    } catch (e) {
+                      console.error("Cache parse error:", e);
+                    }
+                  }
 
-                throw new Error("Bloqueio de Rede: Sua conexão está impedindo o acesso ao Google. Tente usar outra rede ou 4G.");
+                  throw new Error(`Erro de Conexão (${errProxy4.message}). Verifique sua internet ou VPN.`);
+                }
               }
             }
           }
@@ -474,10 +499,7 @@ export default function App() {
       ? (totals.totalHits / (totals.totalHits + totals.totalErrors)) * 100 
       : 0;
 
-    const totalPositiveProfit = data.reduce((acc, curr) => acc + curr.profit, 0); // Soma todos os resultados (Net Profit)
-    const taxes = totalPositiveProfit > 0 ? totalPositiveProfit * 0.19 : 0; // Taxa apenas sobre o lucro real líquido
     const consolidatedValue = initialBalance + totals.totalProfit - totalWithdrawals;
-    const availableBalance = consolidatedValue - taxes;
 
     const dailyRisk = data[0]?.risk || 0;
 
@@ -501,13 +523,17 @@ export default function App() {
       }
     }
 
-    // Calculate days passed (working days strictly <= today if current month)
+    // Calculate days passed (working days strictly completed based on 18:00 cutoff if current month)
     let daysPassed = 0;
+    const currentHour = today.getHours();
+    
     if (selectedMonth < currentMonthIdx) {
       daysPassed = totalWorkingDaysInFullMonth;
     } else if (selectedMonth === currentMonthIdx) {
-      // Re-calculate working days up to today
-      for (let d = 1; d <= currentDay; d++) {
+      // If it's before 18:00, today's operation is not yet "passed" (completed)
+      const lastCompletedDay = currentHour >= 18 ? currentDay : currentDay - 1;
+      
+      for (let d = 1; d <= lastCompletedDay; d++) {
         const date = new Date(currentYear, selectedMonth, d);
         const dayOfWeek = date.getDay();
         const dateKey = `${d.toString().padStart(2, '0')}/${(selectedMonth + 1).toString().padStart(2, '0')}`;
@@ -527,8 +553,6 @@ export default function App() {
     return {
       initialBalance,
       ...totals,
-      taxes,
-      availableBalance,
       winRate,
       dailyRisk,
       progress: {
@@ -604,8 +628,6 @@ export default function App() {
       ["Aporte Inicial", formatCurrency(summary.initialBalance)],
       ["Lucro Bruto", formatCurrency(summary.totalProfit)],
       ["Saques Realizados", formatCurrency(summary.totalWithdrawals)],
-      ["Taxas Acumuladas (19%)", formatCurrency(summary.taxes)],
-      ["Valor Livre (Disponível)", formatCurrency(summary.availableBalance)],
       ["Taxa de Acerto", `${summary.winRate.toFixed(1)}%`],
       ["Saldo Consolidado", formatCurrency(currentBalance)]
     ];
@@ -889,16 +911,16 @@ export default function App() {
         {/* Hero Section: Stats + Charts */}
         <div id="stats-overview" className="grid grid-cols-1 lg:grid-cols-3 gap-10 print:grid-cols-1">
           {/* Main Balance Card */}
-          <section id="balance-card" className="lg:col-span-2 glass-card p-10 flex flex-col justify-between overflow-hidden relative group print:bg-white print:text-black print:p-6 print:border-black">
+          <section id="balance-card" className="lg:col-span-2 glass-card p-6 md:p-8 flex flex-col justify-between overflow-hidden relative group print:bg-white print:text-black print:p-6 print:border-black">
             <div className="absolute -top-32 -right-32 w-80 h-80 bg-orange-600/5 blur-[120px] pointer-events-none group-hover:bg-orange-600/10 transition-all duration-1000 print:hidden"></div>
             
             <div className="flex flex-col items-center justify-center z-10 text-center">
               <div>
-                <p className="text-gray-500 text-xs font-semibold uppercase tracking-[0.2em] mb-4 print:text-black print:mb-2">Saldo Consolidado</p>
-                <div className="flex flex-col items-center justify-center gap-3">
-                  <h2 className="text-5xl md:text-6xl font-light tracking-tight print:text-4xl">{formatCurrency(currentBalance)}</h2>
+                <p className="text-gray-500 text-[10px] font-semibold uppercase tracking-[0.2em] mb-2 print:text-black print:mb-2">Saldo Consolidado</p>
+                <div className="flex flex-col items-center justify-center gap-2">
+                  <h2 className="text-4xl md:text-5xl font-light tracking-tight print:text-4xl">{formatCurrency(currentBalance)}</h2>
                   <span className={cn(
-                    "text-xs font-medium px-2.5 py-1 tracking-wider uppercase print:text-black",
+                    "text-[10px] font-medium px-2 py-0.5 tracking-wider uppercase print:text-black",
                     summary.totalProfit >= 0 ? "text-emerald-400 bg-emerald-400/5 border border-emerald-400/20 print:border-black" : "text-rose-400 bg-rose-400/5 border border-rose-400/20 print:border-black"
                   )}>
                     {summary.totalProfit >= 0 ? "+" : ""}
@@ -908,7 +930,7 @@ export default function App() {
               </div>
             </div>
 
-            <div className="h-[160px] md:h-[240px] mt-12 z-10 w-full print:hidden">
+            <div className="h-[80px] md:h-[100px] mt-6 z-10 w-full print:hidden">
                <ResponsiveContainer width="100%" height="100%">
                 <AreaChart data={data.filter(d => d.risk > 0 || d.profit !== 0)}>
                   <defs>
@@ -929,7 +951,7 @@ export default function App() {
               </ResponsiveContainer>
             </div>
 
-            <div className="grid grid-cols-2 lg:grid-cols-4 gap-8 mt-12 z-10 border-t border-white/5 pt-8 print:mt-4 print:pt-4 print:border-black print:grid-cols-2">
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-6 mt-6 z-10 border-t border-white/5 pt-6 print:mt-4 print:pt-4 print:border-black print:grid-cols-2">
               <StatItem label="Aporte Inicial" value={formatCurrency(summary.initialBalance)} />
               <StatItem label="Lucro Bruto" value={formatCurrency(summary.totalProfit)} color={summary.totalProfit >= 0 ? "text-emerald-400 print:text-black" : "text-rose-400 print:text-black"} />
               <StatItem label="Taxa de Acerto" value={`${summary.winRate.toFixed(1)}%`} />
@@ -938,7 +960,7 @@ export default function App() {
           </section>
 
           {/* Financial Breakdown Section */}
-          <section className="glass-card p-10 flex flex-col justify-between print:bg-white print:text-black print:p-6 print:border-black">
+          <section className="glass-card p-6 md:p-8 flex flex-col justify-between print:bg-white print:text-black print:p-6 print:border-black">
             <div className="w-full space-y-4">
               <div className="mb-6 p-4 bg-white/[0.01] border border-white/[0.03] rounded-md text-center print:bg-transparent print:border-black">
                 <p className="text-[9px] text-gray-600 uppercase font-bold tracking-[0.25em] mb-1 print:text-black">Volume Total Acumulado</p>
@@ -982,12 +1004,6 @@ export default function App() {
 
                 <div className="w-full space-y-4">
                   <OperationRow label="Saques" value={summary.totalWithdrawals} isCurrency color="bg-blue-500" />
-                  <OperationRow label="Taxas (19%)" value={summary.taxes} isCurrency color="bg-orange-500" />
-                </div>
-                
-                <div className="w-full mt-4 p-5 bg-orange-500/10 border border-orange-500/20 rounded-md text-center print:bg-gray-50 print:border-black">
-                  <p className="text-[10px] text-orange-500 uppercase font-bold tracking-widest mb-1 print:text-black">VALOR LIVRE DE TAXAS</p>
-                  <p className="text-2xl font-light text-white print:text-black">{formatCurrency(summary.availableBalance)}</p>
                 </div>
               </div>
             </div>
