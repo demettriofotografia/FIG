@@ -78,6 +78,12 @@ const MONTHS = [
   "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"
 ];
 
+// Brazilian National Holidays 2026 (Format: "DD/MM")
+const BR_HOLIDAYS_2026 = [
+  "01/01", "16/02", "17/02", "03/04", "21/04", "01/05", 
+  "04/06", "07/09", "12/10", "02/11", "15/11", "20/11", "25/12"
+];
+
 // Mapping of Month Index to Spreadsheet GID (if applicable)
 const MONTH_GIDS: Record<number, string> = {
   0: "",         // Jan
@@ -171,68 +177,100 @@ export default function App() {
 
         // Target specific tab (GID) if defined for the selected month
         const targetGid = MONTH_GIDS[selectedMonth];
-        if (targetGid) {
-          if (baseUsedUrl.includes('gid=')) {
-            baseUsedUrl = baseUsedUrl.replace(/gid=[^&]+/, `gid=${targetGid}`);
-          } else {
-            baseUsedUrl += (baseUsedUrl.includes('?') ? '&' : '?') + `gid=${targetGid}`;
-          }
-        }
-
-        // Basic check for "Published to web" format
-        const isPublished = baseUsedUrl.includes('/pub') || baseUsedUrl.includes('/d/e/');
-        const isExport = baseUsedUrl.includes('/export');
         
-        if (!isPublished && !isExport && baseUsedUrl.includes('docs.google.com/spreadsheets/d/')) {
-          // Attempt to convert sharing link to export link if possible
-          const spreadSheetId = baseUsedUrl.match(/\/d\/([a-zA-Z0-9-_]+)/)?.[1];
-          if (spreadSheetId) {
-            baseUsedUrl = `https://docs.google.com/spreadsheets/d/${spreadSheetId}/export?format=csv`;
-          }
+        let exportUrl = baseUsedUrl;
+        const spreadSheetId = baseUsedUrl.match(/\/d\/([a-zA-Z0-9-_]+)/)?.[1];
+        
+        if (spreadSheetId) {
+          // Construct a cleaner export URL which often bypasses certain "pub" blocks
+          exportUrl = `https://docs.google.com/spreadsheets/d/${spreadSheetId}/export?format=csv${targetGid ? `&gid=${targetGid}` : ''}`;
         }
 
-        // Cache busting only if it's a published link (export links sometimes fail with extra params)
+        if (targetGid && !baseUsedUrl.includes('gid=')) {
+          baseUsedUrl += (baseUsedUrl.includes('?') ? '&' : '?') + `gid=${targetGid}`;
+        }
+
         const usedUrl = baseUsedUrl.includes('?') 
           ? `${baseUsedUrl}&_cb=${Date.now()}` 
           : `${baseUsedUrl}?_cb=${Date.now()}`;
         
-        let response;
         let csvText = '';
 
-        const tryFetch = async (url: string, timeout = 5000) => {
-          const controller = new AbortController();
-          const id = setTimeout(() => controller.abort(), timeout);
-          try {
-            const res = await fetch(url, { signal: controller.signal });
-            clearTimeout(id);
-            if (!res.ok) throw new Error(`HTTP ${res.status}`);
-            return await res.text();
-          } catch (err) {
-            clearTimeout(id);
-            throw err;
+        const tryFetch = async (url: string, timeout = 25000, retries = 1) => {
+          for (let i = 0; i <= retries; i++) {
+            const controller = new AbortController();
+            const id = setTimeout(() => controller.abort(), timeout);
+            try {
+              const res = await fetch(url, { 
+                signal: controller.signal,
+                headers: { 'Cache-Control': 'no-cache', 'Pragma': 'no-cache' }
+              });
+              clearTimeout(id);
+              if (!res.ok) throw new Error(`HTTP ${res.status}`);
+              const text = await res.text();
+              if (!text || text.length < 5) throw new Error("Vazio");
+              return text;
+            } catch (err: any) {
+              clearTimeout(id);
+              const isNetwork = err.message === 'Failed to fetch' || err.name === 'TypeError';
+              const isTimeout = err.name === 'AbortError' || err.message === 'Timeout';
+              
+              if (i === retries) {
+                if (isNetwork) throw new Error("NetworkError");
+                if (isTimeout) throw new Error("Timeout");
+                throw err;
+              }
+              await new Promise(r => setTimeout(r, 800));
+            }
           }
+          throw new Error("Falha total");
         };
 
         try {
-          // Attempt 1: Direct fetch with cache bust (Timeout 3s - fast fail if blocked)
-          csvText = await tryFetch(usedUrl, 3000);
-        } catch (err1) {
-          console.warn("Attempt 1 failed (Direct + CB):", err1);
+          // Attempt 1: Direct Export Fetch
           try {
-            // Attempt 2: Direct fetch without cache bust (Timeout 3s)
-            csvText = await tryFetch(baseUsedUrl, 3000);
-          } catch (err2) {
-            console.warn("Attempt 2 failed (Direct):", err2);
+            csvText = await tryFetch(exportUrl, 15000);
+          } catch (e: any) {
+            // Attempt 2: Direct Published Fetch
+            csvText = await tryFetch(usedUrl, 15000);
+          }
+        } catch (err1) {
+          console.warn("Direct attempts failed, trying proxies...", err1);
+          setError("Conexão instável: Tentando pular bloqueio de rede...");
+          
+          // Cascading Proxies
+          try {
+            // Proxy 1: AllOrigins (via fetch wrapper)
+            const p1 = `https://api.allorigins.win/get?url=${encodeURIComponent(exportUrl)}&_cb=${Date.now()}`;
+            const r1 = await tryFetch(p1, 20000);
+            const data1 = JSON.parse(r1);
+            if (data1.contents) csvText = data1.contents;
+            else throw new Error("P1 Empty");
+          } catch (errProxy1) {
+            console.warn("Proxy 1 failed:", errProxy1);
             try {
-              // Attempt 3: Proxy fallback (Timeout 8s - proxies are slower but more reliable)
-              const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(baseUsedUrl)}`;
-              const proxyResponse = await tryFetch(proxyUrl, 8000);
-              const proxyData = JSON.parse(proxyResponse);
-              csvText = proxyData.contents;
-              if (!csvText || csvText.length < 10) throw new Error("Proxy empty content");
-            } catch (err3) {
-              console.error("All fetch attempts failed:", err3);
-              throw new Error("Erro de Conexão: O Google demorou a responder. Tente novamente em instantes ou verifique se a planilha está publicada.");
+              // Proxy 2: CorsProxy.io
+              const p2 = `https://corsproxy.io/?${encodeURIComponent(exportUrl)}`;
+              csvText = await tryFetch(p2, 20000);
+            } catch (errProxy2) {
+              console.warn("Proxy 2 failed:", errProxy2);
+              try {
+                // Proxy 3: Backup Public Gateway
+                const p3 = `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(exportUrl)}`;
+                csvText = await tryFetch(p3, 20000);
+              } catch (errProxy3: any) {
+                console.error("All high-resilience paths failed:", errProxy3);
+                
+                const cached = localStorage.getItem('last_valid_data');
+                if (cached && cached !== '[]') {
+                  setData(JSON.parse(cached));
+                  setLoading(false);
+                  setError("Aviso: Bloqueio de rede detectado. Exibindo última versão salva.");
+                  return;
+                }
+
+                throw new Error("Bloqueio de Rede: Sua conexão está impedindo o acesso ao Google. Tente usar outra rede ou 4G.");
+              }
             }
           }
         }
@@ -262,10 +300,22 @@ export default function App() {
               // Helper to parse numbers from Brazilian/International formats correctly
               const parseValue = (val: string) => {
                 if (!val) return 0;
-                // Remove spaces and currency symbols
-                const cleaned = val.trim().replace(/[^\d.,-]/g, '');
-                // Logic for BR format: Dots as thousands, comma as decimal
-                return parseFloat(cleaned.replace(/\./g, '').replace(',', '.')) || 0;
+                // Clean all except digits, dots, commas and minus sign
+                const cleaned = val.toString().trim().replace(/[^\d.,-]/g, '');
+                if (!cleaned) return 0;
+                
+                // Identify which decimal separator is being used
+                // If there's a comma and it's after the last dot, or if there's only a comma
+                const lastComma = cleaned.lastIndexOf(',');
+                const lastDot = cleaned.lastIndexOf('.');
+                
+                if (lastComma > lastDot) {
+                  // Brazilian format: Comma is decimal
+                  return parseFloat(cleaned.replace(/\./g, '').replace(',', '.')) || 0;
+                } else {
+                  // International format: Dot is decimal
+                  return parseFloat(cleaned.replace(/,/g, '')) || 0;
+                }
               };
 
               // 1. Find Initial Balance, Risk and Total Withdrawals with safe defaults
@@ -313,12 +363,6 @@ export default function App() {
               const year = new Date().getFullYear();
               const daysInMonth = new Date(year, selectedMonth + 1, 0).getDate();
 
-              // Brazilian National Holidays 2026 (Format: "DD/MM")
-              const holidays2026 = [
-                "01/01", "16/02", "17/02", "03/04", "21/04", "01/05", 
-                "04/06", "07/09", "12/10", "02/11", "15/11", "20/11", "25/12"
-              ];
-              
               const monthCalendarDays: { date: number, label: string, isNonWorkingDay: boolean }[] = [];
               for (let d = 1; d <= daysInMonth; d++) {
                 const date = new Date(year, selectedMonth, d);
@@ -329,7 +373,7 @@ export default function App() {
                 const dateKey = `${dayStr}/${monthStr}`;
 
                 const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
-                const isHoliday = holidays2026.includes(dateKey);
+                const isHoliday = BR_HOLIDAYS_2026.includes(dateKey);
 
                 monthCalendarDays.push({ 
                   date: d, 
@@ -366,13 +410,28 @@ export default function App() {
 
               setInitialBalance(foundInitialBalance);
               setTotalWithdrawals(foundTotalWithdrawals);
-              setData(processedData);
+              
+              // Filter out future days
+              const now = new Date();
+              const currentMonthIndex = now.getMonth();
+              const currentDayNumber = now.getDate();
+
+              let filteredData = [...processedData];
+              if (selectedMonth === currentMonthIndex) {
+                // For current month, only show days <= today
+                filteredData = processedData.filter(d => d.day <= currentDayNumber);
+              } else if (selectedMonth > currentMonthIndex) {
+                // For future months, hide everything
+                filteredData = [];
+              }
+              
+              setData(filteredData);
               
               const updatedTime = new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
               setLastUpdated(updatedTime);
               
-              // Persist valid data in case of future connection failure
-              localStorage.setItem('last_valid_data', JSON.stringify(processedData));
+              // Persist filtered data in case of future connection failure
+              localStorage.setItem('last_valid_data', JSON.stringify(filteredData));
               localStorage.setItem('last_balance', foundInitialBalance.toString());
               localStorage.setItem('last_withdrawals', foundTotalWithdrawals.toString());
               localStorage.setItem('last_users', JSON.stringify(foundUsers));
@@ -415,12 +474,55 @@ export default function App() {
       ? (totals.totalHits / (totals.totalHits + totals.totalErrors)) * 100 
       : 0;
 
-    const totalPositiveProfit = data.reduce((acc, curr) => acc + (curr.profit > 0 ? curr.profit : 0), 0);
-    const taxes = totalPositiveProfit * 0.19;
+    const totalPositiveProfit = data.reduce((acc, curr) => acc + curr.profit, 0); // Soma todos os resultados (Net Profit)
+    const taxes = totalPositiveProfit > 0 ? totalPositiveProfit * 0.19 : 0; // Taxa apenas sobre o lucro real líquido
     const consolidatedValue = initialBalance + totals.totalProfit - totalWithdrawals;
     const availableBalance = consolidatedValue - taxes;
 
     const dailyRisk = data[0]?.risk || 0;
+
+    const today = new Date();
+    const currentYear = today.getFullYear();
+    const currentMonthIdx = today.getMonth();
+    const currentDay = today.getDate();
+
+    // Calculate TOTAL working days in the selected month (full month)
+    const daysInMonth = new Date(currentYear, selectedMonth + 1, 0).getDate();
+    let totalWorkingDaysInFullMonth = 0;
+    
+    for (let d = 1; d <= daysInMonth; d++) {
+      const date = new Date(currentYear, selectedMonth, d);
+      const dayOfWeek = date.getDay();
+      const dateKey = `${d.toString().padStart(2, '0')}/${(selectedMonth + 1).toString().padStart(2, '0')}`;
+      const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
+      const isHoliday = BR_HOLIDAYS_2026.includes(dateKey);
+      if (!isWeekend && !isHoliday) {
+        totalWorkingDaysInFullMonth++;
+      }
+    }
+
+    // Calculate days passed (working days strictly <= today if current month)
+    let daysPassed = 0;
+    if (selectedMonth < currentMonthIdx) {
+      daysPassed = totalWorkingDaysInFullMonth;
+    } else if (selectedMonth === currentMonthIdx) {
+      // Re-calculate working days up to today
+      for (let d = 1; d <= currentDay; d++) {
+        const date = new Date(currentYear, selectedMonth, d);
+        const dayOfWeek = date.getDay();
+        const dateKey = `${d.toString().padStart(2, '0')}/${(selectedMonth + 1).toString().padStart(2, '0')}`;
+        const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
+        const isHoliday = BR_HOLIDAYS_2026.includes(dateKey);
+        if (!isWeekend && !isHoliday) {
+          daysPassed++;
+        }
+      }
+    } else {
+      daysPassed = 0;
+    }
+    
+    const daysRemaining = totalWorkingDaysInFullMonth - daysPassed;
+    const progressPercent = totalWorkingDaysInFullMonth > 0 ? (daysPassed / totalWorkingDaysInFullMonth) * 100 : 0;
 
     return {
       initialBalance,
@@ -428,9 +530,15 @@ export default function App() {
       taxes,
       availableBalance,
       winRate,
-      dailyRisk
+      dailyRisk,
+      progress: {
+        total: totalWorkingDaysInFullMonth,
+        passed: daysPassed,
+        remaining: daysRemaining,
+        percent: progressPercent
+      }
     };
-  }, [data, initialBalance]);
+  }, [data, initialBalance, selectedMonth]);
 
   const currentBalance = initialBalance + summary.totalProfit - summary.totalWithdrawals;
 
@@ -703,9 +811,12 @@ export default function App() {
       </div>
 
       {/* Main Content */}
-      <main className="relative z-10 max-w-[1400px] mx-auto p-6 md:p-12 space-y-12 print:p-0 print:space-y-4">
+      <main 
+        id="dashboard-content"
+        className="relative z-10 max-w-[1400px] mx-auto p-6 md:p-12 space-y-12 print:p-0 print:space-y-4"
+      >
         {/* Header with Branding & Logout */}
-        <div className="flex items-center justify-center md:justify-between z-20 relative print:hidden">
+        <div id="dashboard-header" className="flex items-center justify-center md:justify-between z-20 relative print:hidden">
           <div className="flex items-center gap-4">
             <img 
               src="https://lh3.googleusercontent.com/d/1IG128FJsxnPPIy1y2XzmRW3fLSxFxktZ" 
@@ -723,10 +834,10 @@ export default function App() {
           
           <button 
             onClick={handleLogout}
-            className="absolute right-0 md:relative flex items-center gap-2 p-2 md:px-4 md:py-2 bg-transparent md:bg-white/[0.03] border-none md:border md:border-white/5 rounded-md text-[10px] uppercase tracking-widest font-bold text-gray-500 hover:text-rose-500 transition-all group"
+            title="Sair do Painel"
+            className="absolute right-0 md:relative flex items-center p-2.5 bg-white/5 border border-white/10 rounded-full text-gray-500 hover:text-rose-500 transition-all group"
           >
-            <LogOut size={15} className="md:w-3.5 md:h-3.5 group-hover:scale-110 transition-transform" />
-            <span className="hidden md:inline">Sair do Painel</span>
+            <LogOut size={15} className="group-hover:scale-110 transition-transform" />
           </button>
         </div>
 
@@ -752,7 +863,7 @@ export default function App() {
         {/* Month Navigation */}
         <section className="print:hidden">
           <div className="glass-card p-2">
-            <div className="flex items-center gap-1 overflow-x-auto no-scrollbar py-1 px-1">
+            <div className="flex items-center md:justify-center gap-1 overflow-x-auto no-scrollbar py-1 px-1">
               {MONTHS.map((month, index) => {
                 const isSelected = selectedMonth === index;
                 
@@ -761,10 +872,10 @@ export default function App() {
                     key={month}
                     onClick={() => setSelectedMonth(index)}
                     className={cn(
-                      "px-4 py-2 rounded-md text-[9px] uppercase font-bold tracking-widest transition-all shrink-0 whitespace-nowrap",
+                      "px-4 py-2 rounded-md text-[9px] uppercase font-bold tracking-widest transition-all shrink-0 whitespace-nowrap border",
                       isSelected 
-                        ? "bg-orange-500 text-white shadow-lg shadow-orange-500/20" 
-                        : "text-gray-500 hover:text-white hover:bg-white/5"
+                        ? "border-orange-500/40 text-orange-500 shadow-[0_0_15px_rgba(249,115,22,0.1)]" 
+                        : "border-transparent text-gray-500 hover:text-white"
                     )}
                   >
                     {month}
@@ -776,9 +887,9 @@ export default function App() {
         </section>
 
         {/* Hero Section: Stats + Charts */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-10 print:grid-cols-1">
+        <div id="stats-overview" className="grid grid-cols-1 lg:grid-cols-3 gap-10 print:grid-cols-1">
           {/* Main Balance Card */}
-          <section className="lg:col-span-2 glass-card p-10 flex flex-col justify-between overflow-hidden relative group print:bg-white print:text-black print:p-6 print:border-black">
+          <section id="balance-card" className="lg:col-span-2 glass-card p-10 flex flex-col justify-between overflow-hidden relative group print:bg-white print:text-black print:p-6 print:border-black">
             <div className="absolute -top-32 -right-32 w-80 h-80 bg-orange-600/5 blur-[120px] pointer-events-none group-hover:bg-orange-600/10 transition-all duration-1000 print:hidden"></div>
             
             <div className="flex flex-col items-center justify-center z-10 text-center">
@@ -791,7 +902,7 @@ export default function App() {
                     summary.totalProfit >= 0 ? "text-emerald-400 bg-emerald-400/5 border border-emerald-400/20 print:border-black" : "text-rose-400 bg-rose-400/5 border border-rose-400/20 print:border-black"
                   )}>
                     {summary.totalProfit >= 0 ? "+" : ""}
-                    {((summary.totalProfit / summary.initialBalance) * 100).toFixed(2)}%
+                    {(summary.initialBalance !== 0 ? (summary.totalProfit / summary.initialBalance) * 100 : 0).toFixed(2)}%
                   </span>
                 </div>
               </div>
@@ -836,10 +947,45 @@ export default function App() {
 
               <OperationRow label="Acertos" value={summary.totalHits} unit="dias" color="bg-emerald-500" />
               <OperationRow label="Erros" value={summary.totalErrors} unit="dias" color="bg-rose-500" />
-              <div className="pt-4 border-t border-white/5 space-y-4 print:border-black">
-                <OperationRow label="Saques" value={summary.totalWithdrawals} isCurrency color="bg-blue-500" />
-                <OperationRow label="Taxas (19%)" value={summary.taxes} isCurrency color="bg-orange-500" />
-                <div className="mt-4 p-5 bg-orange-500/10 border border-orange-500/20 rounded-md text-center print:bg-gray-50 print:border-black">
+              <div className="pt-4 border-t border-white/5 space-y-4 print:border-black flex flex-col items-center">
+                {/* Monthly Progress Tracker */}
+                <div className="w-full p-4 bg-white/[0.02] border border-white/5 rounded-md space-y-3 print:hidden">
+                  <div className="flex justify-between items-end">
+                    <div className="flex flex-col items-start">
+                      <span className="text-[8px] uppercase tracking-[0.25em] text-gray-600 font-bold mb-1">Pregresso do Mês</span>
+                      <span className="text-sm font-light text-gray-300">
+                        {summary.progress.passed} <span className="text-[10px] text-gray-600 uppercase">Dias Concluídos</span>
+                      </span>
+                    </div>
+                    <div className="text-right">
+                      <span className="text-sm font-light text-orange-500">
+                        {summary.progress.remaining} <span className="text-[10px] text-gray-600 uppercase">Restantes</span>
+                      </span>
+                    </div>
+                  </div>
+                  
+                  <div className="w-full h-1.5 bg-white/5 rounded-full overflow-hidden">
+                    <motion.div 
+                      initial={{ width: 0 }}
+                      animate={{ width: `${summary.progress.percent}%` }}
+                      transition={{ duration: 1, ease: "easeOut" }}
+                      className="h-full bg-orange-500 shadow-[0_0_10px_rgba(249,115,22,0.3)]"
+                    />
+                  </div>
+
+                  <div className="flex justify-between text-[8px] uppercase tracking-widest text-gray-700 font-bold">
+                    <span>Início</span>
+                    <span>{summary.progress.total} Dias de Operação</span>
+                    <span>Meta</span>
+                  </div>
+                </div>
+
+                <div className="w-full space-y-4">
+                  <OperationRow label="Saques" value={summary.totalWithdrawals} isCurrency color="bg-blue-500" />
+                  <OperationRow label="Taxas (19%)" value={summary.taxes} isCurrency color="bg-orange-500" />
+                </div>
+                
+                <div className="w-full mt-4 p-5 bg-orange-500/10 border border-orange-500/20 rounded-md text-center print:bg-gray-50 print:border-black">
                   <p className="text-[10px] text-orange-500 uppercase font-bold tracking-widest mb-1 print:text-black">VALOR LIVRE DE TAXAS</p>
                   <p className="text-2xl font-light text-white print:text-black">{formatCurrency(summary.availableBalance)}</p>
                 </div>
@@ -848,7 +994,7 @@ export default function App() {
           </section>
         </div>
 
-        <section className="glass-card p-10 print:bg-white print:p-0 print:border-none">
+        <section id="performance-table" className="glass-card p-10 print:bg-white print:p-0 print:border-none">
           <div className="flex flex-col md:flex-row items-center justify-between mb-12 print:mb-6">
             <div className="text-center md:text-left">
               <h3 className="text-xs font-semibold uppercase tracking-[0.2em] text-gray-500 mb-2 print:text-black">
@@ -916,24 +1062,26 @@ const DayRow: React.FC<{ data: DayData }> = ({ data }) => {
   const isPositive = data.profit > 0;
   const isLoss = data.profit < 0;
   const isNeutral = data.profit === 0;
+  const isInactive = (data.profit === 0 && data.operations === 0) || data.isNonWorkingDay;
 
-  let barFullColor = "bg-orange-500/60";
+  const barColor = data.isNonWorkingDay 
+    ? "bg-rose-500/20" 
+    : isNeutral 
+      ? "bg-white/10" 
+      : (data.profit > 10 ? "bg-emerald-500/60" : (data.profit < 0 ? "bg-rose-500/60" : "bg-orange-500/60"));
   
-  if (data.profit > 10) {
-    barFullColor = "bg-emerald-500/60";
-  } else if (data.profit < 0) {
-    barFullColor = "bg-rose-500/60";
-  }
-
   return (
     <motion.div 
-      initial={{ opacity: 0, x: -10 }}
-      animate={{ opacity: 1, x: 0 }}
+      initial={{ opacity: 0, y: 10 }}
+      animate={{ opacity: 1, y: 0 }}
+      whileHover={{ scale: 1.005, backgroundColor: "rgba(255, 255, 255, 0.03)" }}
       className={cn(
         "group border transition-all p-4 md:p-6 rounded-md md:grid md:grid-cols-4 flex flex-col gap-4 md:gap-8 items-center md:items-stretch print:grid print:grid-cols-4 print:bg-white print:text-black print:p-2 print:border-black print:gap-2",
         data.isNonWorkingDay 
-          ? "bg-rose-500/5 border-rose-500/20 print:border-black" 
-          : "bg-white/[0.01] border-white/[0.05] hover:bg-white/[0.03] print:border-black"
+          ? "bg-rose-900/5 border-rose-900/20 print:border-black" 
+          : isNeutral
+            ? "bg-white/5 border-white/5"
+            : "bg-white/[0.01] border-white/[0.05] hover:border-white/10 print:border-black"
       )}
     >
       {/* Col 1: Date/Op & Profit (Mobile side-by-side) */}
@@ -941,18 +1089,21 @@ const DayRow: React.FC<{ data: DayData }> = ({ data }) => {
         <div className="flex items-center gap-4">
           <span className={cn(
             "text-xs font-mono font-bold transition-colors tracking-tighter print:text-[8px]",
-            data.isNonWorkingDay ? "text-rose-500" : "text-gray-600 group-hover:text-orange-500 print:text-black"
+            data.isNonWorkingDay ? "text-rose-500" : isNeutral ? "text-gray-600" : "text-gray-400 group-hover:text-orange-500 print:text-black"
           )}>
             {data.displayLabel || data.day.toString().padStart(2, '0')}
           </span>
-          <span className="text-sm font-medium tracking-wide uppercase print:text-[8px]">Dia {data.day}</span>
+          <span className={cn(
+            "text-sm font-medium tracking-wide uppercase print:text-[8px]",
+            isNeutral ? "text-gray-600" : "text-white"
+          )}>Dia {data.day}</span>
         </div>
         
         {/* Profit on the right side for Mobile Only */}
         <div className="md:hidden flex flex-col items-end print:hidden">
           <span className={cn(
             "text-sm font-medium tracking-tight",
-            isPositive ? "text-emerald-400" : isLoss ? "text-rose-400" : "text-orange-400"
+            isNeutral ? "text-gray-600" : (isPositive ? "text-emerald-400" : isLoss ? "text-rose-400" : "text-orange-400")
           )}>
             {data.profit > 0 ? "+" : ""}{formatCurrency(data.profit)}
           </span>
@@ -964,7 +1115,7 @@ const DayRow: React.FC<{ data: DayData }> = ({ data }) => {
       <div className="hidden md:flex flex-col items-center md:items-start w-full md:w-auto print:flex print:flex-col print:items-start">
         <span className={cn(
           "text-sm font-medium tracking-tight print:text-[8px]",
-          isPositive ? "text-emerald-400 print:text-black" : isLoss ? "text-rose-400 print:text-black" : "text-orange-400 print:text-black"
+          isNeutral ? "text-gray-600" : (isPositive ? "text-emerald-400 print:text-black" : isLoss ? "text-rose-400 print:text-black" : "text-orange-400 print:text-black")
         )}>
           {data.profit > 0 ? "+" : ""}{formatCurrency(data.profit)}
         </span>
@@ -977,14 +1128,16 @@ const DayRow: React.FC<{ data: DayData }> = ({ data }) => {
           <motion.div 
             initial={{ width: 0 }}
             animate={{ width: isNeutral ? '20%' : '100%' }}
-            className={cn("h-full transition-all duration-1000 print:bg-black", barFullColor)}
+            className={cn("h-full transition-all duration-1000 print:bg-black", barColor)}
           />
         </div>
         <span className={cn(
           "text-[9px] font-bold uppercase tracking-[0.2em] shrink-0 print:text-[6px]",
-          data.isNonWorkingDay ? "text-rose-500/50 print:text-gray-400" : (isPositive ? "text-emerald-500 print:text-black" : isLoss ? "text-rose-500 print:text-black" : "text-orange-500 print:text-black")
+          data.isNonWorkingDay ? "text-rose-500/50" : isNeutral 
+            ? "text-gray-600 print:text-gray-400" 
+            : (isPositive ? "text-emerald-500 print:text-black" : isLoss ? "text-rose-500 print:text-black" : "text-orange-500 print:text-black")
         )}>
-          {data.isNonWorkingDay ? "OFF" : (isPositive ? "Win" : isLoss ? "Loss" : "Flat")}
+          {data.isNonWorkingDay ? "OFF" : isNeutral ? "ZERADO" : (isPositive ? "Win" : isLoss ? "Loss" : "Flat")}
         </span>
       </div>
 
@@ -993,20 +1146,23 @@ const DayRow: React.FC<{ data: DayData }> = ({ data }) => {
         <div className="flex items-center gap-1.5 shrink-0 print:hidden">
           {Array.from({ length: 4 }).map((_, i) => {
             let activeBars = 0;
-            let barColor = "bg-white/5";
+            let currentBarColor = "bg-white/5";
             
-            if (data.operations < 10) {
+            if (isNeutral || data.isNonWorkingDay) {
+              activeBars = 0;
+              currentBarColor = "bg-white/5";
+            } else if (data.operations < 10) {
               activeBars = 4;
-              barColor = "bg-emerald-500/60";
+              currentBarColor = "bg-emerald-500/60";
             } else if (data.operations >= 10 && data.operations < 20) {
               activeBars = 3;
-              barColor = "bg-yellow-500/60";
+              currentBarColor = "bg-yellow-500/60";
             } else if (data.operations >= 20 && data.operations < 40) {
               activeBars = 2;
-              barColor = "bg-orange-500/60";
+              currentBarColor = "bg-orange-500/60";
             } else {
               activeBars = 1;
-              barColor = "bg-rose-500/60";
+              currentBarColor = "bg-rose-500/60";
             }
 
             const isActive = i < activeBars;
@@ -1014,12 +1170,15 @@ const DayRow: React.FC<{ data: DayData }> = ({ data }) => {
             return (
               <div key={i} className={cn(
                 "w-1 h-3 rounded-[1px] transition-all duration-500",
-                isActive ? barColor : "bg-white/[0.05]"
+                isActive ? currentBarColor : "bg-white/[0.05]"
               )} />
             );
           })}
         </div>
-        <span className="text-[10px] text-gray-500 font-bold uppercase tracking-widest shrink-0 print:text-[6px]">{data.operations} op.</span>
+        <span className={cn(
+          "text-[10px] font-bold uppercase tracking-widest shrink-0 print:text-[6px]",
+          isNeutral ? "text-gray-600" : "text-gray-500"
+        )}>{data.operations} op.</span>
       </div>
     </motion.div>
   );
